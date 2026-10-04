@@ -15,6 +15,7 @@ interface OracleResult {
 
 function oracle(inst: SolverInstance): OracleResult | null {
   const { n, k, loads, isControl, risk, forbidden, minLoad, maxLoad } = inst;
+  const fixed = inst.fixed ?? null;
   let best: OracleResult | null = null;
 
   const assign = new Array<number>(n).fill(0);
@@ -60,6 +61,13 @@ function oracle(inst: SolverInstance): OracleResult | null {
       ) {
         best = cand;
       }
+      return;
+    }
+    const pinned = fixed !== null ? fixed[u]! : -1;
+    if (pinned >= 0) {
+      // Pre-installed positions are immovable: a single legal branch.
+      assign[u] = pinned;
+      enumerate(u + 1);
       return;
     }
     for (let j = 0; j < k; j++) {
@@ -136,6 +144,68 @@ test('solver matches brute-force oracle on random small instances', () => {
     }
   }
   assert.ok(feasibleCount > 50, `expected many feasible random cases, got ${feasibleCount}`);
+});
+
+test('solver matches brute-force oracle on random instances with preassignments', () => {
+  const rng = makeRng(20261004);
+  let feasibleCount = 0;
+  for (let t = 0; t < 400; t++) {
+    const n = 4 + Math.floor(rng() * 5); // 4..8
+    const k = 2 + Math.floor(rng() * 2); // 2..3
+    const names = Array.from({ length: n }, (_, i) => `A${i}`);
+    const loads = Array.from({ length: n }, () => 1 + Math.floor(rng() * 6));
+    const isControl = Array.from({ length: n }, () => rng() < 0.45);
+    if (!isControl.some(Boolean)) isControl[0] = true;
+    const total = loads.reduce((a, b) => a + b, 0);
+    const minLoad = 1 + Math.floor(rng() * Math.min(4, Math.floor(total / k)));
+    const maxLoad = Math.max(minLoad, Math.floor(total / k) + Math.floor(rng() * 8));
+    const threshold = 5;
+    const riskPairs: { a: string; b: string; risk: number }[] = [];
+    for (let i = 0; i < n; i++) {
+      for (let j = i + 1; j < n; j++) {
+        if (rng() < 0.45) {
+          const r = rng() < 0.25
+            ? threshold + Math.floor(rng() * 4) // hard forbidden
+            : 1 + Math.floor(rng() * (threshold - 1));
+          riskPairs.push({ a: names[i]!, b: names[j]!, risk: r });
+        }
+      }
+    }
+    // 1..4 pre-installed (immovable) positions, each pinning a distinct
+    // amplicon to a uniformly random pool.
+    const preCount = 1 + Math.floor(rng() * 4);
+    const chosen = new Set<number>();
+    const preassignments: { amplicon: string; pool: number }[] = [];
+    while (preassignments.length < preCount) {
+      const idx = Math.floor(rng() * n);
+      if (chosen.has(idx)) continue;
+      chosen.add(idx);
+      preassignments.push({ amplicon: names[idx]!, pool: 1 + Math.floor(rng() * k) });
+    }
+    const req: AllocateRequest = {
+      amplicons: names.map((name, i) => ({ name, load: loads[i]!, isControl: isControl[i]! })),
+      poolCount: k,
+      loadRange: { min: minLoad, max: maxLoad },
+      riskPairs,
+      hardThreshold: threshold,
+      preassignments,
+    };
+    const inst = buildInstance(req);
+    const expected = oracle(inst);
+    const actual = solve(inst);
+    if (expected === null) {
+      assert.equal(actual, null, `case ${t}: solver should report infeasible`);
+    } else {
+      feasibleCount++;
+      assert.ok(actual, `case ${t}: solver should find a solution`);
+      assert.deepEqual(
+        [actual!.maxRisk, actual!.totalRisk, actual!.spread, actual!.assignment],
+        [expected.maxRisk, expected.totalRisk, expected.spread, expected.assignment],
+        `case ${t}: objective mismatch`,
+      );
+    }
+  }
+  assert.ok(feasibleCount > 30, `expected a decent number of feasible random cases, got ${feasibleCount}`);
 });
 
 /* ----------------------------- hard-constraint checks ----------------------------- */
@@ -281,6 +351,161 @@ test('lexicographic tie-break is applied after the three numeric objectives', ()
     res.assignment!.map((a) => a.pool),
     [1, 1, 1, 1, 2, 2, 2, 2],
   );
+});
+
+/* ------------------------------- preassignments -------------------------------- */
+
+const trapAmplicons = [
+  { name: 'X', load: 30, isControl: false },
+  { name: 'Y', load: 30, isControl: false },
+  { name: 'Z', load: 30, isControl: false },
+  { name: 'c1', load: 10, isControl: true },
+  { name: 'c2', load: 10, isControl: true },
+  { name: 'c3', load: 10, isControl: true },
+  { name: 'a', load: 30, isControl: false },
+  { name: 'b', load: 30, isControl: false },
+  { name: 'd', load: 30, isControl: false },
+];
+const trapRiskPairs = [
+  { a: 'X', b: 'Y', risk: 9 },
+  { a: 'X', b: 'Z', risk: 9 },
+  { a: 'Y', b: 'Z', risk: 9 },
+  { a: 'a', b: 'X', risk: 7 },
+  { a: 'b', b: 'Y', risk: 7 },
+  { a: 'd', b: 'Z', risk: 7 },
+];
+const trapRequest = (): AllocateRequest => ({
+  amplicons: trapAmplicons.map((a) => ({ ...a })),
+  poolCount: 3,
+  loadRange: { min: 60, max: 80 },
+  riskPairs: trapRiskPairs.map((p) => ({ ...p })),
+  hardThreshold: 9,
+});
+
+test('preassignment changes the optimal allocation while respecting the pinned pool', () => {
+  const unconstrained = allocate(trapRequest());
+  assert.equal(unconstrained.feasible, true);
+  // The unconstrained optimum places amplicon a in pool 2.
+  assert.equal(unconstrained.assignment!.find((x) => x.amplicon === 'a')!.pool, 2);
+
+  const req = trapRequest();
+  req.preassignments = [{ amplicon: 'a', pool: 1 }];
+  const res = assertHardConstraints(req);
+
+  // The pinned position is respected and the whole layout reshuffles.
+  assert.equal(res.assignment!.find((x) => x.amplicon === 'a')!.pool, 1);
+  assert.notDeepEqual(
+    res.assignment!.map((x) => x.pool),
+    unconstrained.assignment!.map((x) => x.pool),
+  );
+  // The optimum is still reachable: zero realised risk, perfectly balanced.
+  assert.equal(res.maxPoolRisk, 0);
+  assert.equal(res.totalRisk, 0);
+  assert.equal(res.loadSpread, 0);
+  // Every pool still carries exactly one control and load 70.
+  for (const p of res.pools!) {
+    assert.equal(p.load, 70);
+    assert.equal(p.controls.length, 1);
+  }
+});
+
+test('preinstalled amplicons count toward controls, loads and risk statistics', () => {
+  // Pin a control into pool 1: it alone satisfies pool 1's control requirement.
+  const req: AllocateRequest = {
+    amplicons: [
+      { name: 'pinnedCtrl', load: 40, isControl: true },
+      { name: 'pinnedHeavy', load: 20, isControl: false },
+      { name: 'f1', load: 20, isControl: false },
+      { name: 'f2', load: 20, isControl: false },
+      { name: 'f3', load: 20, isControl: false },
+      { name: 'f4', load: 20, isControl: false },
+      { name: 'c2', load: 20, isControl: true },
+      { name: 'c3', load: 20, isControl: true },
+    ],
+    poolCount: 3,
+    loadRange: { min: 40, max: 60 },
+    riskPairs: [{ a: 'pinnedCtrl', b: 'pinnedHeavy', risk: 4 }],
+    hardThreshold: 9,
+    preassignments: [
+      { amplicon: 'pinnedCtrl', pool: 1 },
+      { amplicon: 'pinnedHeavy', pool: 1 },
+    ],
+  };
+  const res = assertHardConstraints(req);
+  const pool1 = res.pools!.find((p) => p.pool === 1)!;
+  // Pool 1's load and risk include the pre-installed members.
+  assert.equal(pool1.load, 60);
+  assert.deepEqual(pool1.controls, ['pinnedCtrl']);
+  assert.deepEqual(pool1.riskPairs, [{ a: 'pinnedCtrl', b: 'pinnedHeavy', risk: 4 }]);
+  assert.equal(pool1.riskSum, 4);
+  assert.equal(res.maxPoolRisk, 4);
+  assert.equal(res.totalRisk, 4);
+  // The pre-installed positions appear in the flat assignment list as well.
+  assert.equal(res.assignment!.find((x) => x.amplicon === 'pinnedCtrl')!.pool, 1);
+  assert.equal(res.assignment!.find((x) => x.amplicon === 'pinnedHeavy')!.pool, 1);
+});
+
+test('infeasible: pre-installed forbidden pair in the same pool', () => {
+  const req = trapRequest();
+  req.preassignments = [
+    { amplicon: 'X', pool: 1 },
+    { amplicon: 'Y', pool: 1 },
+  ];
+  const res = allocate(req);
+  assert.equal(res.feasible, false);
+  const conflicts = res.conflictSummary!.preassignmentConflicts!;
+  assert.ok(
+    conflicts.some(
+      (c) =>
+        c.pool === 1 &&
+        c.members.includes('X') &&
+        c.members.includes('Y') &&
+        /forbidden pair/.test(c.rule),
+    ),
+    `expected a forbidden-pair conflict, got ${JSON.stringify(conflicts)}`,
+  );
+});
+
+test('infeasible: pre-installed load exceeds the pool capacity on its own', () => {
+  const req = trapRequest();
+  req.preassignments = [
+    { amplicon: 'a', pool: 1 },
+    { amplicon: 'b', pool: 1 },
+    { amplicon: 'd', pool: 1 },
+  ];
+  const res = allocate(req);
+  assert.equal(res.feasible, false);
+  const conflicts = res.conflictSummary!.preassignmentConflicts!;
+  assert.ok(
+    conflicts.some(
+      (c) =>
+        c.pool === 1 &&
+        c.members.length === 3 &&
+        ['a', 'b', 'd'].every((m) => c.members.includes(m)) &&
+        /exceeds pool max/.test(c.rule),
+    ),
+    `expected a load-overflow conflict, got ${JSON.stringify(conflicts)}`,
+  );
+});
+
+test('omitting preassignments leaves the response unchanged', () => {
+  const plain = allocate(trapRequest());
+  const withEmpty = allocate({ ...trapRequest(), preassignments: undefined });
+  assert.deepEqual(withEmpty, plain);
+});
+
+test('preassigned allocation is deterministic across calls', () => {
+  const req = trapRequest();
+  req.preassignments = [
+    { amplicon: 'a', pool: 1 },
+    { amplicon: 'c2', pool: 3 },
+  ];
+  const first = allocate(req);
+  const second = allocate(req);
+  assert.equal(first.feasible, true);
+  assert.deepEqual(second, first);
+  assert.equal(first.assignment!.find((x) => x.amplicon === 'a')!.pool, 1);
+  assert.equal(first.assignment!.find((x) => x.amplicon === 'c2')!.pool, 3);
 });
 
 /* ------------------------------- infeasibility -------------------------------- */

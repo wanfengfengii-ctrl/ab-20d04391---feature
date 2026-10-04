@@ -57,6 +57,42 @@ test('validation pinpoints array indices, duplicates and unknown names', () => {
   }
 });
 
+test('validation accepts well-formed preassignments', () => {
+  const body: any = validBody();
+  body.preassignments = [
+    { amplicon: 'A0', pool: 1 },
+    { amplicon: 'A5', pool: 2 },
+  ];
+  assert.deepEqual(validateRequest(body), []);
+});
+
+test('validation localizes malformed preassignments', () => {
+  const cases: { pre: unknown; fields: string[] }[] = [
+    { pre: 'not-an-array', fields: ['preassignments'] },
+    { pre: [], fields: ['preassignments'] },
+    { pre: [{ amplicon: 'A0', pool: 1 }, { amplicon: 'A1', pool: 1 }, { amplicon: 'A2', pool: 1 }, { amplicon: 'A3', pool: 1 }, { amplicon: 'A4', pool: 1 }], fields: ['preassignments'] },
+    { pre: [42], fields: ['preassignments[0]'] },
+    { pre: [{ amplicon: '', pool: 1 }], fields: ['preassignments[0].amplicon'] },
+    { pre: [{ amplicon: 'GHOST', pool: 1 }], fields: ['preassignments[0].amplicon'] },
+    { pre: [{ amplicon: 'A0', pool: 1 }, { amplicon: 'A0', pool: 2 }], fields: ['preassignments[1].amplicon'] },
+    { pre: [{ amplicon: 'A0', pool: '1' }], fields: ['preassignments[0].pool'] },
+    { pre: [{ amplicon: 'A0', pool: 0 }], fields: ['preassignments[0].pool'] },
+    { pre: [{ amplicon: 'A0', pool: 3 }], fields: ['preassignments[0].pool'] }, // poolCount is 2
+  ];
+  for (const { pre, fields } of cases) {
+    const body: any = validBody();
+    body.preassignments = pre;
+    const issues = validateRequest(body);
+    assert.ok(issues.length > 0, `expected issues for ${JSON.stringify(pre)}`);
+    for (const f of fields) {
+      assert.ok(
+        issues.some((i) => i.field === f),
+        `expected issue at ${f} for ${JSON.stringify(pre)}, got ${issues.map((i) => i.field).join(', ')}`,
+      );
+    }
+  }
+});
+
 /* --------------------------------- HTTP layer -------------------------------- */
 
 async function startServer(): Promise<number> {
@@ -115,6 +151,79 @@ test('HTTP: health, success, validation error, infeasible and malformed JSON',
 
     const nf = await fetch(`http://127.0.0.1:${port}/nope`);
     assert.equal(nf.status, 404);
+
+    /* ------------------------- preassignment over HTTP ------------------------- */
+
+    const trap = {
+      amplicons: [
+        { name: 'X', load: 30, isControl: false },
+        { name: 'Y', load: 30, isControl: false },
+        { name: 'Z', load: 30, isControl: false },
+        { name: 'c1', load: 10, isControl: true },
+        { name: 'c2', load: 10, isControl: true },
+        { name: 'c3', load: 10, isControl: true },
+        { name: 'a', load: 30, isControl: false },
+        { name: 'b', load: 30, isControl: false },
+        { name: 'd', load: 30, isControl: false },
+      ],
+      poolCount: 3,
+      loadRange: { min: 60, max: 80 },
+      riskPairs: [
+        { a: 'X', b: 'Y', risk: 9 },
+        { a: 'X', b: 'Z', risk: 9 },
+        { a: 'Y', b: 'Z', risk: 9 },
+        { a: 'a', b: 'X', risk: 7 },
+        { a: 'b', b: 'Y', risk: 7 },
+        { a: 'd', b: 'Z', risk: 7 },
+      ],
+      hardThreshold: 9,
+    };
+    const unconstrained = await post(port, trap);
+    assert.equal(unconstrained.json.feasible, true);
+
+    // A pre-installed position is respected and reshuffles the optimal layout.
+    const pinned = await post(port, { ...trap, preassignments: [{ amplicon: 'a', pool: 1 }] });
+    assert.equal(pinned.status, 200);
+    assert.equal(pinned.json.feasible, true);
+    const pinnedWhere = new Map(pinned.json.assignment.map((x: any) => [x.amplicon, x.pool]));
+    assert.equal(pinnedWhere.get('a'), 1, 'pinned amplicon stays in its pool');
+    const plainWhere = new Map(unconstrained.json.assignment.map((x: any) => [x.amplicon, x.pool]));
+    assert.notDeepEqual(
+      pinned.json.assignment.map((x: any) => x.pool),
+      unconstrained.json.assignment.map((x: any) => x.pool),
+      'the pre-installed position changes the optimal allocation',
+    );
+    assert.equal(plainWhere.get('a'), 2, 'sanity: unconstrained optimum puts a in pool 2');
+    assert.equal(pinned.json.maxPoolRisk, 0);
+    assert.equal(pinned.json.loadSpread, 0);
+
+    // A pre-installed forbidden pair proves infeasibility and is reported.
+    const conflict = await post(port, {
+      ...trap,
+      preassignments: [
+        { amplicon: 'X', pool: 1 },
+        { amplicon: 'Y', pool: 1 },
+      ],
+    });
+    assert.equal(conflict.status, 200);
+    assert.equal(conflict.json.feasible, false);
+    const preConflicts = conflict.json.conflictSummary?.preassignmentConflicts ?? [];
+    assert.ok(
+      preConflicts.some(
+        (c: any) => c.pool === 1 && c.members.includes('X') && c.members.includes('Y'),
+      ),
+      `expected a preassignment conflict for X/Y in pool 1, got ${JSON.stringify(preConflicts)}`,
+    );
+
+    // Invalid preassignments are rejected with field-located issues.
+    const badPre = await post(port, {
+      ...validBody(),
+      preassignments: [{ amplicon: 'GHOST', pool: 9 }],
+    });
+    assert.equal(badPre.status, 400);
+    const badPreFields = new Set((badPre.json.issues ?? []).map((i: any) => i.field));
+    assert.ok(badPreFields.has('preassignments[0].amplicon'));
+    assert.ok(badPreFields.has('preassignments[0].pool'));
 
     after(() => server.close());
   });

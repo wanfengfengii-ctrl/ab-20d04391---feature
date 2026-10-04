@@ -3,7 +3,12 @@ import {
   solve,
   type SolverInstance,
 } from './solver.js';
-import type { AllocateRequest, AllocateResponse, PoolResult } from './types.js';
+import type {
+  AllocateRequest,
+  AllocateResponse,
+  PoolResult,
+  PreassignmentConflict,
+} from './types.js';
 
 export function buildInstance(req: AllocateRequest): SolverInstance {
   const n = req.amplicons.length;
@@ -27,6 +32,15 @@ export function buildInstance(req: AllocateRequest): SolverInstance {
     }
   }
 
+  // Pre-installed (immovable) positions, 1-based pool -> 0-based index.
+  let fixed: Int8Array | null = null;
+  if (req.preassignments !== undefined) {
+    fixed = new Int8Array(n).fill(-1);
+    for (const pa of req.preassignments) {
+      fixed[index.get(pa.amplicon)!] = pa.pool - 1;
+    }
+  }
+
   return {
     n,
     k,
@@ -37,6 +51,7 @@ export function buildInstance(req: AllocateRequest): SolverInstance {
     minLoad: req.loadRange.min,
     maxLoad: req.loadRange.max,
     forbidden,
+    fixed,
   };
 }
 
@@ -113,6 +128,48 @@ function buildConflictSummary(inst: SolverInstance) {
   if (reason?.kind === 'load') out.loadIssue = reason.detail;
   if (reason?.kind === 'clique' && reason.clique) {
     out.overCapacityClique = reason.clique.map((i) => inst.names[i]!);
+  }
+
+  const preConflicts = preassignmentConflicts(inst);
+  if (preConflicts.length > 0) out.preassignmentConflicts = preConflicts;
+
+  return out;
+}
+
+/**
+ * Hard-constraint violations already forced by the pre-installed positions:
+ * a forbidden pair pinned into the same pool, or a pre-installed load that
+ * exceeds the pool capacity on its own.
+ */
+function preassignmentConflicts(inst: SolverInstance): PreassignmentConflict[] {
+  const out: PreassignmentConflict[] = [];
+  const fixed = inst.fixed;
+  if (!fixed) return out;
+  for (let j = 0; j < inst.k; j++) {
+    const members: number[] = [];
+    for (let i = 0; i < inst.n; i++) if (fixed[i] === j) members.push(i);
+    if (members.length === 0) continue;
+    for (let x = 0; x < members.length; x++) {
+      for (let y = x + 1; y < members.length; y++) {
+        const u = members[x]!;
+        const v = members[y]!;
+        if (inst.forbidden[u * inst.n + v]) {
+          out.push({
+            members: [inst.names[u]!, inst.names[v]!],
+            pool: j + 1,
+            rule: `forbidden pair (risk ${inst.risk[u * inst.n + v]} reaches the hard threshold) pre-installed in the same pool`,
+          });
+        }
+      }
+    }
+    const load = members.reduce((sum, i) => sum + inst.loads[i]!, 0);
+    if (load > inst.maxLoad) {
+      out.push({
+        members: members.map((i) => inst.names[i]!),
+        pool: j + 1,
+        rule: `pre-installed load ${load} exceeds pool max ${inst.maxLoad}`,
+      });
+    }
   }
   return out;
 }

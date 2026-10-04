@@ -47,8 +47,12 @@ docker compose run --rm verify
 3. wait for the app's `/health` endpoint,
 4. live API checks including a **non-greedy trap** (the greedy "emptiest pool"
    layout realizes risk 7 per pool; the service must return the exact risk-0,
-   perfectly balanced allocation, independently re-verified), invalid-input
-   field localization and legal-but-infeasible conflict summaries.
+   perfectly balanced allocation, independently re-verified), a
+   **pre-installed position** scenario (pinning one amplicon reshuffles the
+   optimal allocation while the optimum stays reachable, and pre-installed
+   hard-constraint violations are reported with members, pool and rule),
+   invalid-input field localization and legal-but-infeasible conflict
+   summaries.
 
 Exit mask: `1` build, `2` tests, `4` health, `8` API — `0` means all passed.
 
@@ -89,6 +93,32 @@ APP_URL=http://127.0.0.1:3000 VERIFY_CWD=$PWD node scripts/verify.mjs
 | `loadRange` | positive integers, `min <= max` |
 | `riskPairs` | unordered pairs of known, distinct names; `risk` non-negative integer; no duplicates |
 | `hardThreshold` | non-negative integer; a listed pair with `risk >= hardThreshold` is forbidden |
+| `preassignments` | *optional*; 1–4 entries, each a known amplicon name and its 1-based pool number; each amplicon at most once |
+
+`preassignments` models amplicons the lab has already loaded into fixed pool
+positions before automatic planning. Those positions are immovable: the
+pre-installed amplicons still count toward per-pool controls, loads, hard
+forbidden pairs and risk statistics, only the remaining amplicons are
+allocated, and the same four-level adjudication (largest single-pool risk,
+total risk, load spread, then the pool-number sequence in recording order) is
+applied. Omitting the field leaves every response unchanged. If a
+pre-installed position already violates a hard constraint — a forbidden pair
+pinned into one pool, or a pre-installed load exceeding the pool capacity —
+the request is reported infeasible and the conflict summary lists the
+involved members, the pool number and the violated rule:
+
+```json
+{
+  "feasible": false,
+  "conflictSummary": {
+    "forbiddenPairs": [],
+    "overCapacityClique": [],
+    "preassignmentConflicts": [
+      { "members": ["X", "Y"], "pool": 1, "rule": "forbidden pair (risk 9 reaches the hard threshold) pre-installed in the same pool" }
+    ]
+  }
+}
+```
 
 Success (`200`):
 

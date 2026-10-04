@@ -122,3 +122,49 @@ test('objective ordering: minimising max-pool risk beats total risk', () => {
   assert.equal(res.maxPoolRisk, 0);
   assert.equal(res.totalRisk, 0);
 });
+
+test('scale with preassignments: n=18, k=4, four pinned positions stays fast and exact', () => {
+  const rng = makeRng(777001);
+  const n = 18;
+  const amplicons = Array.from({ length: n }, (_, i) => ({
+    name: `amp_${i}`,
+    load: 4 + Math.floor(rng() * 9),
+    isControl: i % 4 === 0,
+  }));
+  const riskPairs: { a: string; b: string; risk: number }[] = [];
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      if (rng() < 0.4) {
+        riskPairs.push({
+          a: amplicons[i]!.name,
+          b: amplicons[j]!.name,
+          risk: Math.floor(rng() * 10),
+        });
+      }
+    }
+  }
+  // Pin four distinct amplicons (one per pool) before the automatic planning.
+  const preassignments = [0, 1, 2, 3].map((pool) => ({
+    amplicon: amplicons[pool * 4]!.name, // amp_0, amp_4, amp_8, amp_12 (all controls)
+    pool: pool + 1,
+  }));
+  const req: AllocateRequest = {
+    amplicons,
+    poolCount: 4,
+    loadRange: { min: 20, max: 90 },
+    riskPairs,
+    hardThreshold: 8,
+    preassignments,
+  };
+  const t0 = process.hrtime.bigint();
+  const res = allocate(req);
+  const ms = Number(process.hrtime.bigint() - t0) / 1e6;
+  assert.ok(ms < 2000, `solver too slow: ${ms.toFixed(0)}ms`);
+  assert.equal(res.feasible, true);
+  const where = new Map(res.assignment!.map((x) => [x.amplicon, x.pool]));
+  for (const pa of preassignments) {
+    assert.equal(where.get(pa.amplicon), pa.pool, `${pa.amplicon} must stay in pool ${pa.pool}`);
+  }
+  // Determinism: a second run returns the identical response.
+  assert.deepEqual(allocate(req), res);
+});

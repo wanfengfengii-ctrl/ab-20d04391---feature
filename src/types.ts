@@ -21,6 +21,14 @@ export interface RiskPairInput {
   risk: number;
 }
 
+/** One pre-installed (immovable) amplicon position. */
+export interface PreassignmentInput {
+  /** Amplicon name; must reference a known amplicon. */
+  amplicon: string;
+  /** 1-based pool number (1..poolCount). */
+  pool: number;
+}
+
 export interface AllocateRequest {
   amplicons: AmpliconInput[];
   /** Number of parallel reaction pools, 2..4. */
@@ -30,6 +38,13 @@ export interface AllocateRequest {
   riskPairs: RiskPairInput[];
   /** Pairs whose risk reaches this value are forbidden from sharing a pool. */
   hardThreshold: number;
+  /**
+   * Optional pre-installed (immovable) amplicon positions: 1–4 entries, each
+   * naming a known amplicon and its 1-based pool number. Pre-installed
+   * amplicons still count toward per-pool controls, loads, hard forbidden
+   * pairs and risk statistics; only the remaining amplicons are allocated.
+   */
+  preassignments?: PreassignmentInput[];
 }
 
 export interface PoolResult {
@@ -39,6 +54,16 @@ export interface PoolResult {
   controls: string[];
   riskPairs: { a: string; b: string; risk: number }[];
   riskSum: number;
+}
+
+/** A hard-constraint violation already forced by the pre-installed positions. */
+export interface PreassignmentConflict {
+  /** Pre-installed amplicons involved, in recording order. */
+  members: string[];
+  /** 1-based pool number where the rule is violated. */
+  pool: number;
+  /** Human-readable description of the violated rule. */
+  rule: string;
 }
 
 export interface ConflictSummary {
@@ -53,6 +78,12 @@ export interface ConflictSummary {
   poolsWithoutControl?: number;
   /** Load-range explanation, when the interval itself can never fit. */
   loadIssue?: string;
+  /**
+   * Hard-constraint violations already forced by the pre-installed positions
+   * (a forbidden pair pinned into one pool, or a pre-installed load that
+   * exceeds the pool capacity on its own).
+   */
+  preassignmentConflicts?: PreassignmentConflict[];
 }
 
 export interface AllocateResponse {

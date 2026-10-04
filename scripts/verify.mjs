@@ -9,6 +9,10 @@
  *   4. exercise POST /api/pools/allocate:
  *        - a non-greedy trap request (greedy placement is suboptimal; the
  *          exact answer must be returned and re-checked client-side)
+ *        - a pre-installed position scenario (pinning one amplicon reshuffles
+ *          the optimal allocation while the optimum stays reachable) and
+ *          pre-installed hard-constraint violations (conflict summary names
+ *          members, pool and rule)
  *        - an invalid request (field-located errors)
  *        - a legal-but-infeasible request (conflict summary)
  *        - determinism: the same feasible request twice yields the same body
@@ -186,6 +190,91 @@ if (healthy) {
         'assignment follows amplicon recording order',
       );
     }
+
+    // Pre-installed positions: a pinned amplicon changes the optimal allocation.
+    // The unconstrained optimum places amplicon a in pool 2; pinning it into
+    // pool 1 reshuffles the layout while the optimum stays reachable.
+    if (j.feasible) {
+      const pinnedTrap = { ...trap, preassignments: [{ amplicon: 'a', pool: 1 }] };
+      const r2 = await post(pinnedTrap);
+      expect(r2.status === 200, `pinned trap HTTP status 200 (got ${r2.status})`);
+      const pj = r2.json;
+      expect(pj.feasible === true, 'pinned trap is feasible');
+      if (pj.feasible) {
+        const where = new Map(pj.assignment.map((x) => [x.amplicon, x.pool]));
+        const plainWhere = new Map(j.assignment.map((x) => [x.amplicon, x.pool]));
+        expect(where.get('a') === 1, 'pinned amplicon a stays in pool 1');
+        expect(plainWhere.get('a') === 2, 'sanity: unconstrained optimum puts a in pool 2');
+        expect(where.size === 9, 'all 9 amplicons assigned with a pinned');
+        expect(
+          trap.amplicons.some((amp) => where.get(amp.name) !== plainWhere.get(amp.name)),
+          'the pre-installed position changes the optimal allocation',
+        );
+        expect(pj.maxPoolRisk === 0, `pinned max pool risk is 0 (got ${pj.maxPoolRisk})`);
+        expect(pj.totalRisk === 0, `pinned total risk is 0 (got ${pj.totalRisk})`);
+        expect(pj.loadSpread === 0, `pinned load spread is 0 (got ${pj.loadSpread})`);
+        // Re-verify every hard constraint and reported number client-side.
+        const seen = new Set();
+        for (const p of pj.pools) {
+          const wantLoad = p.members
+            .map((m) => trap.amplicons.find((a) => a.name === m).load)
+            .reduce((x, y) => x + y, 0);
+          expect(p.load === wantLoad, `pinned pool ${p.pool} load ${p.load} equals recomputed ${wantLoad}`);
+          expect(p.load >= 60 && p.load <= 80, `pinned pool ${p.pool} load ${p.load} inside [60,80]`);
+          expect(p.controls.length >= 1, `pinned pool ${p.pool} has a positive control`);
+          for (const rp of p.riskPairs) {
+            expect(rp.risk < trap.hardThreshold, `pinned pool ${p.pool} pair (${rp.a},${rp.b}) below hard threshold`);
+          }
+          for (const m of p.members) {
+            expect(!seen.has(m), `pinned amplicon ${m} assigned exactly once`);
+            seen.add(m);
+          }
+        }
+        for (const rp of trap.riskPairs) {
+          if (rp.risk >= trap.hardThreshold) {
+            expect(where.get(rp.a) !== where.get(rp.b), `pinned: forbidden pair ${rp.a}/${rp.b} separated`);
+          }
+        }
+        // Determinism with a pinned position.
+        const r2b = await post(pinnedTrap);
+        expect(
+          JSON.stringify(r2b.json) === JSON.stringify(pj),
+          'repeated pinned request gives byte-identical allocation',
+        );
+      }
+    }
+
+    // A pre-installed forbidden pair proves infeasibility; the conflict summary
+    // names the members, the pool and the violated rule.
+    const r3 = await post({ ...trap, preassignments: [{ amplicon: 'X', pool: 1 }, { amplicon: 'Y', pool: 1 }] });
+    expect(r3.status === 200, `forbidden-pair pinned trap HTTP 200 (got ${r3.status})`);
+    expect(r3.json.feasible === false, 'pre-installed forbidden pair is infeasible');
+    const fpConflicts = r3.json.conflictSummary?.preassignmentConflicts ?? [];
+    expect(
+      fpConflicts.some(
+        (c) => c.pool === 1 && c.members.includes('X') && c.members.includes('Y') && /forbidden pair/.test(c.rule),
+      ),
+      `conflict summary names X/Y in pool 1 with the violated rule (got ${JSON.stringify(fpConflicts)})`,
+    );
+
+    // A pre-installed load that exceeds the pool capacity is infeasible too.
+    const r4 = await post({
+      ...trap,
+      preassignments: [
+        { amplicon: 'a', pool: 1 },
+        { amplicon: 'b', pool: 1 },
+        { amplicon: 'd', pool: 1 },
+      ],
+    });
+    expect(r4.status === 200, `overload pinned trap HTTP 200 (got ${r4.status})`);
+    expect(r4.json.feasible === false, 'pre-installed overload is infeasible');
+    const olConflicts = r4.json.conflictSummary?.preassignmentConflicts ?? [];
+    expect(
+      olConflicts.some(
+        (c) => c.pool === 1 && ['a', 'b', 'd'].every((m) => c.members.includes(m)) && /exceeds pool max/.test(c.rule),
+      ),
+      `conflict summary names a/b/d in pool 1 with the load rule (got ${JSON.stringify(olConflicts)})`,
+    );
 
     // Invalid input must be rejected with field-located issues.
     const bad = await post({

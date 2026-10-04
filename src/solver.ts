@@ -25,6 +25,13 @@
  *
  * The search is exhaustive, so a negative answer proves that no feasible
  * allocation exists.
+ *
+ * Pre-installed (immovable) positions (`fixed`) are placed before the search
+ * and count toward every hard constraint and objective; only the remaining
+ * amplicons are allocated. Pools holding pre-installed members are pinned
+ * (their labels are no longer interchangeable), while pools without any
+ * pre-installed member remain interchangeable and are still opened in
+ * increasing label order, so symmetry breaking stays sound and complete.
  */
 
 export interface SolverInstance {
@@ -39,6 +46,13 @@ export interface SolverInstance {
   maxLoad: number;
   /** Only *listed* pairs with risk >= threshold are hard-forbidden. */
   forbidden: Uint8Array;
+  /**
+   * Pre-installed (immovable) positions: `fixed[i]` is the 0-based pool index
+   * amplicon i is pinned to, or -1 when it is freely allocatable. Pinned
+   * amplicons still count toward every hard constraint and every objective;
+   * absent or null means no pre-installations.
+   */
+  fixed?: Int8Array | null;
 }
 
 export interface SolverSolution {
@@ -166,6 +180,7 @@ export function solve(inst: SolverInstance): SolverSolution | null {
   if (obviousInfeasibility(inst)) return null;
 
   const { n, k, loads, isControl, risk, forbidden, minLoad, maxLoad } = inst;
+  const fixed = inst.fixed ?? null;
   const totalLoad = loads.reduce((a, b) => a + b, 0);
 
   // Per-amplicon forbidden-neighbour bit masks.
@@ -389,9 +404,51 @@ export function solve(inst: SolverInstance): SolverSolution | null {
   let bestTotal = Infinity;
   let bestSpread = Infinity;
 
-  const firstEmptyPool = (): number => {
-    for (let j = 0; j < k; j++) if (st.members[j] === 0) return j;
-    return k;
+  // Pre-installed (immovable) positions are placed before the search; they
+  // count toward every hard constraint and objective.
+  const preplace = (): void => {
+    if (fixed === null) return;
+    for (let i = 0; i < n; i++) {
+      const j = fixed[i]!;
+      if (j >= 0) place(st, i, j);
+    }
+  };
+  preplace();
+
+  // A pre-installed layout that already violates a hard constraint proves
+  // infeasibility by itself.
+  if (fixed !== null) {
+    for (let j = 0; j < k; j++) {
+      if (st.poolLoad[j]! > maxLoad) return null;
+      let mm = st.members[j]!;
+      while (mm) {
+        const u = 31 - Math.clz32(mm & -mm);
+        let nn = mm & (mm - 1);
+        while (nn) {
+          const v = 31 - Math.clz32(nn & -nn);
+          if (forbidden[u * n + v]) return null;
+          nn &= nn - 1;
+        }
+        mm &= mm - 1;
+      }
+    }
+  }
+
+  /**
+   * Pools a variable may be placed into without breaking canonical labelling:
+   * every currently non-empty pool plus the smallest-indexed empty pool.
+   * Pinned (pre-installed) pools are non-empty from the start, so they are
+   * always legal targets; empty pools are interchangeable and are therefore
+   * opened in increasing label order.
+   */
+  const legalPoolMask = (): number => {
+    let mask = 0;
+    let firstEmpty = -1;
+    for (let j = 0; j < k; j++) {
+      if (st.members[j] !== 0) mask |= 1 << j;
+      else if (firstEmpty === -1) firstEmpty = j;
+    }
+    return firstEmpty === -1 ? (1 << k) - 1 : mask | (1 << firstEmpty);
   };
 
   const phase1 = (): void => {
@@ -437,8 +494,7 @@ export function solve(inst: SolverInstance): SolverSolution | null {
       return;
     }
 
-    const firstEmpty = firstEmptyPool();
-    const legalMask = (1 << (firstEmpty + 1)) - 1;
+    const legalMask = legalPoolMask();
 
     // MRV variable selection over symmetry-legal pools
     let bestU = -1;
@@ -447,8 +503,9 @@ export function solve(inst: SolverInstance): SolverSolution | null {
     while (vm) {
       const u = 31 - Math.clz32(vm & -vm);
       const count = popcount(allowedMaskFor(st, u) & legalMask);
-      // An empty pool accepts every amplicon, so a symmetry-legal domain of 0
-      // implies the true domain is 0 as well.
+      // Empty pools are interchangeable (same load, no members), so an
+      // amplicon that fits any empty pool also fits the smallest one; a
+      // symmetry-legal domain of 0 therefore implies the true domain is 0.
       if (count === 0) return;
       if (count < bestCount) {
         bestCount = count;
@@ -525,8 +582,14 @@ export function solve(inst: SolverInstance): SolverSolution | null {
       return;
     }
 
+    // Pinned (pre-installed) variables are already placed; skip them.
+    if (fixed !== null && fixed[u]! >= 0) {
+      phase2(u + 1);
+      return;
+    }
+
     if (st.curMaxRisk > bestMax || st.curTotalRisk > bestTotal) return;
-    const rem = ((1 << n) - 1) ^ ((1 << u) - 1);
+    const rem = st.remMask;
     if (!prefixFeasible(st, rem, bestSpread)) return;
 
     // Lexicographic pruning against the incumbent: the assigned prefix is
@@ -548,16 +611,11 @@ export function solve(inst: SolverInstance): SolverSolution | null {
     if (prefixCmp === 1) return;
 
     // Empty-pool symmetry breaking: with variables fixed in recording order,
-    // the lexicographically smallest solution is always canonically labelled
-    // (pool labels appear in order of first use), so this restriction never
-    // hides the optimum.
-    let firstEmpty = k;
-    for (let j = 0; j < k; j++) if (st.members[j] === 0) {
-      firstEmpty = j;
-      break;
-    }
-
-    const allowed = allowedMaskFor(st, u) & ((1 << (firstEmpty + 1)) - 1);
+    // the lexicographically smallest solution is canonically labelled (pools
+    // without pre-installed members appear in order of first use), so this
+    // restriction never hides the optimum. Pinned pools are non-empty from
+    // the start and therefore remain legal targets throughout.
+    const allowed = allowedMaskFor(st, u) & legalPoolMask();
     for (let j = 0; j < k; j++) {
       if ((allowed & (1 << j)) === 0) continue;
       if (prefixCmp === 0 && lexBest !== null && j > lexBest[u]!) continue;
@@ -580,6 +638,7 @@ export function solve(inst: SolverInstance): SolverSolution | null {
       st.remMask = (1 << n) - 1;
       st.curMaxRisk = 0;
       st.curTotalRisk = 0;
+      preplace();
       phase2(0);
     }
   } catch (e) {

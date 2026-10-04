@@ -85,19 +85,22 @@ export function validateRequest(body: unknown): ValidationIssue[] {
     issues.push({ field: 'hardThreshold', message: 'must be a non-negative integer' });
   }
 
+  // Names known to the amplicon list (shared by riskPairs and preassignments).
+  const knownNames = new Set<string>(
+    Array.isArray(req.amplicons)
+      ? req.amplicons
+          .map((a) => (a && typeof a === 'object' ? (a as Record<string, unknown>).name : undefined))
+          .filter((n): n is string => typeof n === 'string')
+      : [],
+  );
+
   // ---- riskPairs ----
   if (!('riskPairs' in req)) {
     issues.push({ field: 'riskPairs', message: 'is required' });
   } else if (!Array.isArray(req.riskPairs)) {
     issues.push({ field: 'riskPairs', message: 'must be an array' });
   } else {
-    const names = new Set<string>(
-      Array.isArray(req.amplicons)
-        ? req.amplicons
-            .map((a) => (a && typeof a === 'object' ? (a as Record<string, unknown>).name : undefined))
-            .filter((n): n is string => typeof n === 'string')
-        : [],
-    );
+    const names = knownNames;
     const pairKeys = new Set<string>();
     req.riskPairs.forEach((item, i) => {
       const p = `riskPairs[${i}]`;
@@ -128,6 +131,52 @@ export function validateRequest(body: unknown): ValidationIssue[] {
         }
       }
     });
+  }
+
+  // ---- preassignments (optional) ----
+  if ('preassignments' in req) {
+    if (!Array.isArray(req.preassignments)) {
+      issues.push({ field: 'preassignments', message: 'must be an array' });
+    } else {
+      const list = req.preassignments;
+      if (list.length < 1 || list.length > 4) {
+        issues.push({
+          field: 'preassignments',
+          message: `must contain between 1 and 4 preassignments (got ${list.length})`,
+        });
+      }
+      const pc = req.poolCount;
+      const poolCount = isInt(pc) && pc >= 2 && pc <= 4 ? pc : null;
+      const seen = new Map<string, number>();
+      list.forEach((item, i) => {
+        const p = `preassignments[${i}]`;
+        if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+          issues.push({ field: p, message: 'must be an object' });
+          return;
+        }
+        const pa = item as Record<string, unknown>;
+        if (typeof pa.amplicon !== 'string' || pa.amplicon === '') {
+          issues.push({ field: `${p}.amplicon`, message: 'must be a non-empty amplicon name' });
+        } else if (!knownNames.has(pa.amplicon)) {
+          issues.push({ field: `${p}.amplicon`, message: `unknown amplicon name "${pa.amplicon}"` });
+        } else if (seen.has(pa.amplicon)) {
+          issues.push({
+            field: `${p}.amplicon`,
+            message: `duplicate preassigned amplicon "${pa.amplicon}", first seen at index ${seen.get(pa.amplicon)}`,
+          });
+        } else {
+          seen.set(pa.amplicon, i);
+        }
+        if (!isInt(pa.pool)) {
+          issues.push({ field: `${p}.pool`, message: 'must be an integer' });
+        } else if (pa.pool < 1 || (poolCount !== null && pa.pool > poolCount)) {
+          issues.push({
+            field: `${p}.pool`,
+            message: `must be a 1-based pool number between 1 and ${poolCount ?? 'poolCount'}`,
+          });
+        }
+      });
+    }
   }
 
   return issues;
