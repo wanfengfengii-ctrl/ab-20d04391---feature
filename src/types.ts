@@ -11,6 +11,15 @@ export interface AmpliconInput {
   isControl: boolean;
 }
 
+/**
+ * An immovable placement: the lab already put this amplicon into the given
+ * 1-based reaction pool before automatic allocation.
+ */
+export interface PreassignmentInput {
+  amplicon: string;
+  pool: number;
+}
+
 /** Unordered amplicon pair with a non-negative dimer risk score. */
 export interface RiskPairInput {
   /** Amplicon name (order of a/b does not matter). */
@@ -30,6 +39,11 @@ export interface AllocateRequest {
   riskPairs: RiskPairInput[];
   /** Pairs whose risk reaches this value are forbidden from sharing a pool. */
   hardThreshold: number;
+  /**
+   * Optional 1..4 immovable placements (1-based pool numbers) that were made
+   * in the lab before automatic allocation. Omitted/absent means none.
+   */
+  preassignments?: PreassignmentInput[];
 }
 
 export interface PoolResult {
@@ -39,6 +53,17 @@ export interface PoolResult {
   controls: string[];
   riskPairs: { a: string; b: string; risk: number }[];
   riskSum: number;
+}
+
+export interface PreassignmentConflict {
+  /** Members co-located by their fixed placements that trigger the rule. */
+  members: string[];
+  /** 1-based pool whose preassigned content violates the rule. */
+  pool: number;
+  /** Which rule the preassigned placement violates. */
+  rule: 'forbiddenPair' | 'poolOverloaded';
+  /** Risk score when rule is "forbiddenPair". */
+  risk?: number;
 }
 
 export interface ConflictSummary {
@@ -53,6 +78,12 @@ export interface ConflictSummary {
   poolsWithoutControl?: number;
   /** Load-range explanation, when the interval itself can never fit. */
   loadIssue?: string;
+  /**
+   * Preassigned placements that already break a hard rule on their own
+   * (forbidden pair forced into the same pool, or a pool preloaded past its
+   * max); present only when preassignments make feasibility impossible.
+   */
+  preassignmentConflicts?: PreassignmentConflict[];
 }
 
 export interface AllocateResponse {

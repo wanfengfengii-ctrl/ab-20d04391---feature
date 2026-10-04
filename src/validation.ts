@@ -1,4 +1,4 @@
-import type { AllocateRequest, ValidationIssue } from './types.js';
+import type { ValidationIssue } from './types.js';
 
 const isInt = (v: unknown): v is number =>
   typeof v === 'number' && Number.isSafeInteger(v);
@@ -130,9 +130,80 @@ export function validateRequest(body: unknown): ValidationIssue[] {
     });
   }
 
+  // ---- preassignments (optional; references amplicons and poolCount) ----
+  if ('preassignments' in req) {
+    const names = new Set<string>(
+      Array.isArray(req.amplicons)
+        ? req.amplicons
+            .map((a) => (a && typeof a === 'object' ? (a as Record<string, unknown>).name : undefined))
+            .filter((n): n is string => typeof n === 'string')
+        : [],
+    );
+    const poolCountOk =
+      isInt(req.poolCount) && req.poolCount >= 2 && req.poolCount <= 4
+        ? (req.poolCount as number)
+        : null;
+    issues.push(...validatePreassignments(req, names, poolCountOk));
+  }
+
   return issues;
 }
 
-export function asRequest(body: unknown): AllocateRequest {
-  return body as AllocateRequest;
+/**
+ * Validate the optional `preassignments` array separately so that its field
+ * checks can reference the already-validated amplicons and pool count.
+ * Rules: 1..4 entries, object shape, known amplicon name (located at the
+ * entry), no amplicon preassigned twice, pool integer within [1, poolCount].
+ */
+export function validatePreassignments(
+  body: Record<string, unknown>,
+  names: Set<string>,
+  poolCountOk: number | null,
+): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  if (!('preassignments' in body)) return issues;
+  const raw = body.preassignments;
+  if (!Array.isArray(raw)) {
+    issues.push({ field: 'preassignments', message: 'must be an array' });
+    return issues;
+  }
+  if (raw.length < 1 || raw.length > 4) {
+    issues.push({
+      field: 'preassignments',
+      message: `must contain between 1 and 4 preassignments (got ${raw.length})`,
+    });
+  }
+  const seen = new Map<string, number>();
+  raw.forEach((item, i) => {
+    const p = `preassignments[${i}]`;
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+      issues.push({ field: p, message: 'must be an object' });
+      return;
+    }
+    const pa = item as Record<string, unknown>;
+    if (typeof pa.amplicon !== 'string' || pa.amplicon === '') {
+      issues.push({ field: `${p}.amplicon`, message: 'must be a non-empty amplicon name' });
+    } else if (!names.has(pa.amplicon)) {
+      issues.push({
+        field: `${p}.amplicon`,
+        message: `unknown amplicon name "${pa.amplicon}"`,
+      });
+    } else if (seen.has(pa.amplicon)) {
+      issues.push({
+        field: `${p}.amplicon`,
+        message: `amplicon "${pa.amplicon}" is already preassigned at index ${seen.get(pa.amplicon)}`,
+      });
+    } else {
+      seen.set(pa.amplicon, i);
+    }
+    if (!isInt(pa.pool)) {
+      issues.push({ field: `${p}.pool`, message: 'must be an integer pool number' });
+    } else if (poolCountOk !== null && (pa.pool < 1 || pa.pool > poolCountOk)) {
+      issues.push({
+        field: `${p}.pool`,
+        message: `pool number must be between 1 and ${poolCountOk} (got ${pa.pool})`,
+      });
+    }
+  });
+  return issues;
 }

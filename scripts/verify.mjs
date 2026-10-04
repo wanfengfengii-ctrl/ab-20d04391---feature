@@ -9,6 +9,11 @@
  *   4. exercise POST /api/pools/allocate:
  *        - a non-greedy trap request (greedy placement is suboptimal; the
  *          exact answer must be returned and re-checked client-side)
+ *        - a preassignment request where one immovable placement changes the
+ *          optimal allocation (the unconstrained optimum is forbidden by the
+ *          fixed pool)
+ *        - preassignment-driven impossibility (fixed forbidden pair and an
+ *          overloaded preloaded pool), with located conflict summaries
  *        - an invalid request (field-located errors)
  *        - a legal-but-infeasible request (conflict summary)
  *        - determinism: the same feasible request twice yields the same body
@@ -48,7 +53,7 @@ if (run('npx', ['tsc', '-p', 'tsconfig.json']) !== 0) {
 /* -------------------------------- stage 2: tests ------------------------------- */
 if ((failures & 1) === 0) {
   log('test', 'running node:test suite...');
-  if (run('node', ['--test', 'dist/test/solver.test.js', 'dist/test/api.test.js', 'dist/test/scale.test.js']) !== 0) {
+  if (run('node', ['--test', 'dist/test/solver.test.js', 'dist/test/api.test.js', 'dist/test/preassign.test.js', 'dist/test/scale.test.js']) !== 0) {
     fail('test', 'test suite failed');
     failures |= 2;
   }
@@ -235,6 +240,145 @@ if (healthy) {
     expect(clique.json.feasible === false, 'K3-into-2-pools reported infeasible');
     const cq = new Set(clique.json.conflictSummary?.overCapacityClique ?? []);
     expect(cq.size === 3 && ['A0', 'A1', 'A2'].every((x) => cq.has(x)), 'conflict summary lists the K3 clique');
+
+    /* --------------------- preassignments --------------------- */
+
+    // A soft pair (risk 4) that the unconstrained optimum separates. Fixing
+    // both ends into pool 1 must move the optimum from risk 0 to risk 4 while
+    // keeping every hard constraint; the immovable positions are honoured and
+    // reflected in members/assignment/load/risk detail.
+    const preBase = {
+      amplicons: Array.from({ length: 8 }, (_, i) => ({ name: `B${i}`, load: 10, isControl: true })),
+      poolCount: 2,
+      loadRange: { min: 30, max: 50 },
+      riskPairs: [
+        { a: 'B0', b: 'B2', risk: 4 },
+        { a: 'B1', b: 'B3', risk: 4 },
+      ],
+      hardThreshold: 9,
+    };
+    const preFree = await post(preBase);
+    expect(preFree.json.feasible === true, 'preassignment baseline feasible');
+    expect(preFree.json.maxPoolRisk === 0, `baseline optimum risk 0 (got ${preFree.json.maxPoolRisk})`);
+
+    const preOne = await post({ ...preBase, preassignments: [{ amplicon: 'B0', pool: 2 }] });
+    expect(preOne.json.feasible === true, 'single preassignment feasible');
+    expect(preOne.json.maxPoolRisk === 0, 'single preassignment keeps the numeric optimum');
+    expect(
+      preOne.json.assignment.find((x) => x.amplicon === 'B0').pool === 2,
+      'single preassignment pins B0 to pool 2 and re-labels the canonical allocation',
+    );
+    expect(
+      JSON.stringify(preOne.json.assignment.map((x) => x.pool)) !==
+        JSON.stringify(preFree.json.assignment.map((x) => x.pool)),
+      'one fixed placement changes the optimal allocation vs the unconstrained one',
+    );
+
+    const preBoth = await post({
+      ...preBase,
+      preassignments: [
+        { amplicon: 'B0', pool: 1 },
+        { amplicon: 'B2', pool: 1 },
+      ],
+    });
+    const pb = preBoth.json;
+    expect(preBoth.status === 200, `forced-pair HTTP 200 (got ${preBoth.status})`);
+    expect(pb.feasible === true, 'forced soft pair still yields a feasible allocation');
+    expect(pb.maxPoolRisk === 4, `immovable co-location raises optimum max risk to 4 (got ${pb.maxPoolRisk})`);
+    expect(pb.totalRisk === 4, `total risk is 4 (got ${pb.totalRisk})`);
+    const preWhere = new Map(pb.assignment.map((x) => [x.amplicon, x.pool]));
+    expect(preWhere.get('B0') === 1 && preWhere.get('B2') === 1, 'both fixed amplicons stay in pool 1');
+    expect(preWhere.size === 8, 'preassignment response still assigns every amplicon once');
+    const prePool1 = pb.pools.find((p) => p.pool === 1);
+    expect(
+      prePool1.members.includes('B0') && prePool1.members.includes('B2'),
+      'pool 1 members list reflects the fixed pair',
+    );
+    expect(
+      prePool1.riskPairs.some((rp) => rp.a === 'B0' && rp.b === 'B2' && rp.risk === 4),
+      'pool 1 risk detail reports the forced risk-4 pair',
+    );
+    expect(prePool1.riskSum === 4, 'pool 1 riskSum reflects the fixed pair');
+    expect(prePool1.load === prePool1.members.length * 10, 'pool 1 load reflects fixed + allocated members');
+    for (const p of pb.pools) {
+      expect(p.load >= 30 && p.load <= 50, `preassigned pool ${p.pool} load in range`);
+      expect(p.controls.length >= 1, `preassigned pool ${p.pool} has a control`);
+    }
+
+    // Determinism with preassignments.
+    const preBoth2 = await post({
+      ...preBase,
+      preassignments: [
+        { amplicon: 'B0', pool: 1 },
+        { amplicon: 'B2', pool: 1 },
+      ],
+    });
+    expect(JSON.stringify(preBoth2.json) === JSON.stringify(pb), 'preassigned allocation is deterministic');
+
+    // Invalid preassignments are rejected with field-located issues.
+    const preBad = await post({
+      ...preBase,
+      preassignments: [
+        { amplicon: 'GHOST', pool: 1 },
+        { amplicon: 'B0', pool: 3 },
+        { amplicon: 'B1', pool: 1 },
+        { amplicon: 'B1', pool: 2 },
+      ],
+    });
+    expect(preBad.status === 400, `invalid preassignments HTTP 400 (got ${preBad.status})`);
+    const preBadFields = new Set((preBad.json.issues ?? []).map((i) => i.field));
+    for (const f of ['preassignments[0].amplicon', 'preassignments[1].pool', 'preassignments[3].amplicon']) {
+      expect(preBadFields.has(f), `validation issue located at ${f}`);
+    }
+
+    // Fixed forbidden pair: impossible, with members/pool/rule in the summary.
+    const preForbidden = await post({
+      ...preBase,
+      riskPairs: [{ a: 'B0', b: 'B1', risk: 9 }],
+      preassignments: [
+        { amplicon: 'B0', pool: 1 },
+        { amplicon: 'B1', pool: 1 },
+      ],
+    });
+    expect(preForbidden.json.feasible === false, 'fixed forbidden pair reported infeasible');
+    const fc = preForbidden.json.conflictSummary?.preassignmentConflicts ?? [];
+    expect(fc.length === 1, 'one preassignment conflict reported for the fixed forbidden pair');
+    expect(
+      fc[0] && fc[0].rule === 'forbiddenPair' && fc[0].pool === 1 &&
+        new Set(fc[0].members).size === 2 && ['B0', 'B1'].every((m) => fc[0].members.includes(m)) &&
+        fc[0].risk === 9,
+      'conflict summary names the members, pool, rule and risk',
+    );
+
+    // Preloaded pool already over max (aggregate load bounds still pass).
+    const preOver = await post({
+      amplicons: [
+        { name: 'F0', load: 10, isControl: true },
+        { name: 'F1', load: 10, isControl: true },
+        { name: 'F2', load: 10, isControl: true },
+        { name: 'x0', load: 4, isControl: true },
+        { name: 'x1', load: 4, isControl: false },
+        { name: 'x2', load: 4, isControl: false },
+        { name: 'x3', load: 4, isControl: false },
+        { name: 'x4', load: 4, isControl: false },
+      ],
+      poolCount: 2,
+      loadRange: { min: 20, max: 25 },
+      riskPairs: [],
+      hardThreshold: 9,
+      preassignments: [
+        { amplicon: 'F0', pool: 1 },
+        { amplicon: 'F1', pool: 1 },
+        { amplicon: 'F2', pool: 1 },
+      ],
+    });
+    expect(preOver.json.feasible === false, 'preloaded-over-max pool reported infeasible');
+    const oc = preOver.json.conflictSummary?.preassignmentConflicts ?? [];
+    expect(
+      oc.length === 1 && oc[0].rule === 'poolOverloaded' && oc[0].pool === 1 &&
+        ['F0', 'F1', 'F2'].every((m) => oc[0].members.includes(m)),
+      'overload summary names the fixed members, pool and poolOverloaded rule',
+    );
   } catch (err) {
     expect(false, `API check threw: ${err instanceof Error ? err.stack : err}`);
   }

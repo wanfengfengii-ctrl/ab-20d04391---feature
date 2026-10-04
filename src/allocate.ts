@@ -1,5 +1,6 @@
 import {
   obviousInfeasibility,
+  preassignmentViolations,
   solve,
   type SolverInstance,
 } from './solver.js';
@@ -27,6 +28,12 @@ export function buildInstance(req: AllocateRequest): SolverInstance {
     }
   }
 
+  // Immovable lab placements; -1 means the amplicon is still to be allocated.
+  const fixed = new Int8Array(n).fill(-1);
+  for (const pa of req.preassignments ?? []) {
+    fixed[index.get(pa.amplicon)!]! = pa.pool - 1;
+  }
+
   return {
     n,
     k,
@@ -37,6 +44,7 @@ export function buildInstance(req: AllocateRequest): SolverInstance {
     minLoad: req.loadRange.min,
     maxLoad: req.loadRange.max,
     forbidden,
+    fixed,
   };
 }
 
@@ -113,6 +121,16 @@ function buildConflictSummary(inst: SolverInstance) {
   if (reason?.kind === 'load') out.loadIssue = reason.detail;
   if (reason?.kind === 'clique' && reason.clique) {
     out.overCapacityClique = reason.clique.map((i) => inst.names[i]!);
+  }
+
+  const preConflicts = preassignmentViolations(inst);
+  if (preConflicts.length > 0) {
+    out.preassignmentConflicts = preConflicts.map((v) => ({
+      members: v.members.map((i) => inst.names[i]!),
+      pool: v.pool + 1,
+      rule: v.kind === 'forbiddenPair' ? 'forbiddenPair' : 'poolOverloaded',
+      ...(v.risk !== undefined ? { risk: v.risk } : {}),
+    }));
   }
   return out;
 }

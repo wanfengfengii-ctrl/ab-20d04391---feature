@@ -26,6 +26,19 @@ The search is exhaustive (MRV + forward checking + Hall matching for controls +
 subset-sum reachability + pool symmetry elimination), so `feasible: false`
 proves that no allocation exists.
 
+### Preassigned (immovable) placements
+
+Before automatic allocation the lab may already have placed 1–4 amplicons into
+specific numbered reaction pools. Pass them as the optional `preassignments`
+field. A preassigned amplicon is never moved: it is seeded into its pool before
+the search and still counts toward that pool's control requirement, load,
+forbidden-pair and risk statistics. The remaining amplicons are allocated
+exactly as above, with the same four-level tie-break over the now-restricted
+space. If fixed placements alone already force a forbidden pair into one pool
+or push a pool's load past its maximum, no allocation exists and the response
+reports exactly which members and pool violate which rule. Omitting the field
+(or sending no preassignments) leaves every existing behaviour unchanged.
+
 ## Run
 
 ```bash
@@ -47,7 +60,9 @@ docker compose run --rm verify
 3. wait for the app's `/health` endpoint,
 4. live API checks including a **non-greedy trap** (the greedy "emptiest pool"
    layout realizes risk 7 per pool; the service must return the exact risk-0,
-   perfectly balanced allocation, independently re-verified), invalid-input
+   perfectly balanced allocation, independently re-verified), a
+   **preassignment scenario** where an immovable placement changes the optimal
+   allocation (and fixed placements that make it infeasible), invalid-input
    field localization and legal-but-infeasible conflict summaries.
 
 Exit mask: `1` build, `2` tests, `4` health, `8` API — `0` means all passed.
@@ -78,7 +93,10 @@ APP_URL=http://127.0.0.1:3000 VERIFY_CWD=$PWD node scripts/verify.mjs
   "riskPairs": [
     { "a": "X", "b": "Y", "risk": 9 }
   ],
-  "hardThreshold": 9
+  "hardThreshold": 9,
+  "preassignments": [
+    { "amplicon": "X", "pool": 1 }
+  ]
 }
 ```
 
@@ -89,6 +107,7 @@ APP_URL=http://127.0.0.1:3000 VERIFY_CWD=$PWD node scripts/verify.mjs
 | `loadRange` | positive integers, `min <= max` |
 | `riskPairs` | unordered pairs of known, distinct names; `risk` non-negative integer; no duplicates |
 | `hardThreshold` | non-negative integer; a listed pair with `risk >= hardThreshold` is forbidden |
+| `preassignments` | optional; 1–4 entries `{amplicon, pool}`; name must reference an amplicon (located at `preassignments[i].amplicon`), each amplicon at most once, `pool` integer in `1..poolCount`; those placements are immovable |
 
 Success (`200`):
 
@@ -135,6 +154,23 @@ Legal but unsatisfiable (`200`):
     "overCapacityClique": ["A0", "A1", "A2"],
     "poolsWithoutControl": 2,
     "loadIssue": "..."
+  }
+}
+```
+
+When immovable placements alone break a hard rule, the summary lists each
+conflict with its members, 1-based pool and the violated rule
+(`forbiddenPair` with its `risk`, or `poolOverloaded`):
+
+```json
+{
+  "feasible": false,
+  "conflictSummary": {
+    "forbiddenPairs": [{ "a": "A0", "b": "A1", "risk": 9 }],
+    "overCapacityClique": [],
+    "preassignmentConflicts": [
+      { "members": ["A0", "A1"], "pool": 1, "rule": "forbiddenPair", "risk": 9 }
+    ]
   }
 }
 ```

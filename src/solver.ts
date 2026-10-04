@@ -39,6 +39,23 @@ export interface SolverInstance {
   maxLoad: number;
   /** Only *listed* pairs with risk >= threshold are hard-forbidden. */
   forbidden: Uint8Array;
+  /**
+   * Immovable placements, per amplicon (0-based pool), -1 when free.
+   * Preassigned amplicons are seeded into the pools before the search and may
+   * never be moved; pools may also be pre-filled non-empty.
+   */
+  fixed: Int8Array;
+}
+
+/** A hard rule already broken by the preassigned placements alone. */
+export interface PreassignmentViolation {
+  /** Preassigned members co-located in one pool that trigger the rule. */
+  members: number[];
+  /** 0-based pool. */
+  pool: number;
+  kind: 'forbiddenPair' | 'overload';
+  /** Risk score for forbiddenPair violations. */
+  risk?: number;
 }
 
 export interface SolverSolution {
@@ -151,6 +168,48 @@ export function obviousInfeasibility(
   return null;
 }
 
+/**
+ * Hard rules broken by the preassigned placements on their own, before any
+ * free amplicon is allocated:
+ *   - two preassigned members forced into one pool form a forbidden pair;
+ *   - the preassigned load of a pool already exceeds its maximum.
+ * Such conflicts can never be repaired because preassigned positions are
+ * immovable, so they prove infeasibility directly.
+ */
+export function preassignmentViolations(inst: SolverInstance): PreassignmentViolation[] {
+  const out: PreassignmentViolation[] = [];
+  if (inst.fixed.every((f) => f === -1)) return out;
+
+  const byPool: number[][] = Array.from({ length: inst.k }, () => []);
+  for (let i = 0; i < inst.n; i++) {
+    if (inst.fixed[i] !== -1) byPool[inst.fixed[i]!]!.push(i);
+  }
+
+  for (let j = 0; j < inst.k; j++) {
+    const members = byPool[j]!;
+    let fixedLoad = 0;
+    for (const i of members) fixedLoad += inst.loads[i]!;
+    if (fixedLoad > inst.maxLoad) {
+      out.push({ kind: 'overload', pool: j, members: [...members].sort((a, b) => a - b) });
+    }
+    for (let x = 0; x < members.length; x++) {
+      for (let y = x + 1; y < members.length; y++) {
+        const i = members[x]!;
+        const w = members[y]!;
+        if (inst.forbidden[i * inst.n + w]) {
+          out.push({
+            kind: 'forbiddenPair',
+            pool: j,
+            members: [Math.min(i, w), Math.max(i, w)],
+            risk: inst.risk[i * inst.n + w]!,
+          });
+        }
+      }
+    }
+  }
+  return out;
+}
+
 interface SearchState {
   poolLoad: Int32Array;
   poolRisk: Int32Array;
@@ -164,9 +223,15 @@ interface SearchState {
 
 export function solve(inst: SolverInstance): SolverSolution | null {
   if (obviousInfeasibility(inst)) return null;
+  // Immovable placements that already break a hard rule can never be repaired.
+  if (preassignmentViolations(inst).length > 0) return null;
 
   const { n, k, loads, isControl, risk, forbidden, minLoad, maxLoad } = inst;
   const totalLoad = loads.reduce((a, b) => a + b, 0);
+
+  // Free (non-preassigned) amplicon indices, in recording order.
+  const freeOrder: number[] = [];
+  for (let i = 0; i < n; i++) if (inst.fixed[i] === -1) freeOrder.push(i);
 
   // Per-amplicon forbidden-neighbour bit masks.
   const forbidMask = new Int32Array(n);
@@ -176,16 +241,48 @@ export function solve(inst: SolverInstance): SolverSolution | null {
     forbidMask[i] = m;
   }
 
-  const newState = (): SearchState => ({
-    poolLoad: new Int32Array(k),
-    poolRisk: new Int32Array(k),
-    poolControl: new Int32Array(k),
-    members: new Int32Array(k),
-    assignment: new Int8Array(n),
-    remMask: (1 << n) - 1,
-    curMaxRisk: 0,
-    curTotalRisk: 0,
-  });
+  const newState = (): SearchState => {
+    const st: SearchState = {
+      poolLoad: new Int32Array(k),
+      poolRisk: new Int32Array(k),
+      poolControl: new Int32Array(k),
+      members: new Int32Array(k),
+      assignment: new Int8Array(n).fill(-1),
+      remMask: (1 << n) - 1,
+      curMaxRisk: 0,
+      curTotalRisk: 0,
+    };
+    seedFixed(st);
+    return st;
+  };
+
+  /** Place every preassigned amplicon into its immovable pool. */
+  const seedFixed = (st: SearchState): void => {
+    for (let i = 0; i < n; i++) {
+      const j = inst.fixed[i]!;
+      if (j === -1) continue;
+      const added = addedRiskStatic(st, i, j);
+      st.poolLoad[j]! += loads[i]!;
+      st.poolRisk[j]! += added;
+      st.poolControl[j]! += isControl[i] ? 1 : 0;
+      st.members[j]! |= 1 << i;
+      st.assignment[i]! = j;
+      st.remMask &= ~(1 << i);
+      st.curTotalRisk += added;
+      if (st.poolRisk[j]! > st.curMaxRisk) st.curMaxRisk = st.poolRisk[j]!;
+    }
+  };
+
+  const addedRiskStatic = (st: SearchState, u: number, j: number): number => {
+    let added = 0;
+    let mm = st.members[j]!;
+    while (mm) {
+      const wv = mm & -mm;
+      added += risk[u * n + (31 - Math.clz32(wv))]!;
+      mm &= mm - 1;
+    }
+    return added;
+  };
 
   let nodes = 0;
   const tick = (): void => {
@@ -389,9 +486,25 @@ export function solve(inst: SolverInstance): SolverSolution | null {
   let bestTotal = Infinity;
   let bestSpread = Infinity;
 
-  const firstEmptyPool = (): number => {
-    for (let j = 0; j < k; j++) if (st.members[j] === 0) return j;
-    return k;
+  /**
+   * Empty-pool symmetry breaking that remains valid when some pools are
+   * pre-filled (and therefore carry immovable labels): every non-empty pool
+   * is legal, plus only the lowest still-empty pool (higher empty pools are
+   * freely permutable with it). Without preassignments every non-empty pool
+   * sits below the first empty one, so this is exactly the old mask.
+   */
+  const symmetryLegalMask = (): number => {
+    let mask = 0;
+    let firstEmpty = k;
+    for (let j = 0; j < k; j++) {
+      if (st.members[j] !== 0) {
+        mask |= 1 << j;
+      } else if (j < firstEmpty) {
+        firstEmpty = j;
+      }
+    }
+    if (firstEmpty < k) mask |= 1 << firstEmpty;
+    return mask;
   };
 
   const phase1 = (): void => {
@@ -437,8 +550,7 @@ export function solve(inst: SolverInstance): SolverSolution | null {
       return;
     }
 
-    const firstEmpty = firstEmptyPool();
-    const legalMask = (1 << (firstEmpty + 1)) - 1;
+    const legalMask = symmetryLegalMask();
 
     // MRV variable selection over symmetry-legal pools
     let bestU = -1;
@@ -503,9 +615,9 @@ export function solve(inst: SolverInstance): SolverSolution | null {
 
   let lexBest: Int8Array | null = bestAssignment === null ? null : Int8Array.from(bestAssignment);
 
-  const phase2 = (u: number): void => {
+  const phase2 = (t: number): void => {
     tick();
-    if (u === n) {
+    if (t === freeOrder.length) {
       for (let j = 0; j < k; j++) {
         const l = st.poolLoad[j]!;
         if (l < minLoad || l > maxLoad || st.poolControl[j] === 0) return;
@@ -525,13 +637,16 @@ export function solve(inst: SolverInstance): SolverSolution | null {
       return;
     }
 
+    // Only free amplicons are decided here; preassigned ones stay seeded.
+    const u = freeOrder[t]!;
+
     if (st.curMaxRisk > bestMax || st.curTotalRisk > bestTotal) return;
-    const rem = ((1 << n) - 1) ^ ((1 << u) - 1);
-    if (!prefixFeasible(st, rem, bestSpread)) return;
+    if (!prefixFeasible(st, st.remMask, bestSpread)) return;
 
     // Lexicographic pruning against the incumbent: the assigned prefix is
-    // compared with the best sequence. Because variables run in recording
-    // order, a prefix already greater than the incumbent can never recover.
+    // compared with the best sequence. Because free variables are visited in
+    // recording order (fixed ones are constants shared by every solution), a
+    // prefix already greater than the incumbent can never recover.
     let prefixCmp = 0; // -1: smaller, 0: equal, 1: greater
     if (lexBest !== null) {
       for (let i = 0; i < u; i++) {
@@ -547,22 +662,17 @@ export function solve(inst: SolverInstance): SolverSolution | null {
     }
     if (prefixCmp === 1) return;
 
-    // Empty-pool symmetry breaking: with variables fixed in recording order,
-    // the lexicographically smallest solution is always canonically labelled
-    // (pool labels appear in order of first use), so this restriction never
-    // hides the optimum.
-    let firstEmpty = k;
-    for (let j = 0; j < k; j++) if (st.members[j] === 0) {
-      firstEmpty = j;
-      break;
-    }
+    // Empty-pool symmetry breaking, respecting pre-filled (immovably labelled)
+    // pools: with free variables taken in recording order, the lexicographically
+    // smallest solution never uses a higher still-empty pool before the lowest.
+    const legalMask = symmetryLegalMask();
 
-    const allowed = allowedMaskFor(st, u) & ((1 << (firstEmpty + 1)) - 1);
+    const allowed = allowedMaskFor(st, u) & legalMask;
     for (let j = 0; j < k; j++) {
       if ((allowed & (1 << j)) === 0) continue;
       if (prefixCmp === 0 && lexBest !== null && j > lexBest[u]!) continue;
       const { added, prevMax } = place(st, u, j);
-      phase2(u + 1);
+      phase2(t + 1);
       unplace(st, u, j, added, prevMax);
     }
   };
@@ -570,7 +680,7 @@ export function solve(inst: SolverInstance): SolverSolution | null {
   try {
     phase1();
     if (bestAssignment !== null) {
-      // Phase 2 restarts from an empty state: numeric objectives are fixed and
+      // Phase 2 restarts from a seeded state: numeric objectives are fixed and
       // it searches for the lexicographically smallest full labelling.
       st.poolLoad.fill(0);
       st.poolRisk.fill(0);
@@ -580,6 +690,7 @@ export function solve(inst: SolverInstance): SolverSolution | null {
       st.remMask = (1 << n) - 1;
       st.curMaxRisk = 0;
       st.curTotalRisk = 0;
+      seedFixed(st);
       phase2(0);
     }
   } catch (e) {
