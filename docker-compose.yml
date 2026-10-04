@@ -1,0 +1,36 @@
+services:
+  app:
+    build:
+      context: .
+      target: app
+    image: pcr-pool-allocator:latest
+    environment:
+      # In-container listen port; the host-side port is mapped from APP_PORT.
+      APP_PORT: "3000"
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:'+(process.env.APP_PORT||3000)+'/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 3s
+
+  # One-shot service: builds, tests, waits for app health and verifies the API
+  # with a non-greedy trap request. Exits with a bit-mask summary code.
+  verify:
+    build:
+      context: .
+      target: verify
+    image: pcr-pool-allocator-verify:latest
+    environment:
+      APP_URL: "http://app:3000"
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: "no"
